@@ -7,148 +7,123 @@ the first 100 entries for quick iteration but can scale to the entire dataset by
 adjusting the `--limit` flag.
 """
 
-from __future__ import annotations
-
-import argparse
 import sqlite3
-from io import BytesIO
-from typing import Iterable, Optional
-
-import imagehash
 import requests
-from PIL import Image
-from tqdm import tqdm
+import argparse
+import os
+import sys
 
-BULK_METADATA_URL = "https://api.scryfall.com/bulk-data/unique-artwork"
-DEFAULT_DB_PATH = "cards.db"
+# DATABASE SETUP
+DB_PATH = "cards.db"
 
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS cards
+                 (id TEXT PRIMARY KEY, card_name TEXT, image_url TEXT, set_name TEXT, set_code TEXT, image_blob BLOB)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS phashes
+                 (card_id TEXT, phash TEXT, 
+                  FOREIGN KEY(card_id) REFERENCES cards(id))''')
+    conn.commit()
+    conn.close()
 
-def fetch_bulk_download_url() -> str:
-    """Retrieve the download URI for the Unique Artwork bulk JSON."""
-    response = requests.get(BULK_METADATA_URL, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    download_uri = data.get("download_uri")
-    if not download_uri:
-        raise RuntimeError("Failed to locate download_uri in Scryfall bulk metadata.")
-    return download_uri
-
-
-def download_bulk_cards(download_uri: str) -> list[dict]:
-    """Download the full Unique Artwork JSON."""
-    response = requests.get(download_uri, timeout=120)
-    response.raise_for_status()
-    return response.json()
-
-
-def ensure_schema(connection: sqlite3.Connection) -> None:
-    """Create the cards table if it does not exist."""
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            card_name TEXT NOT NULL,
-            set_code TEXT NOT NULL,
-            phash TEXT NOT NULL
-        )
-        """
-    )
-    cursor.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_name_set
-        ON cards(card_name, set_code)
-        """
-    )
-    connection.commit()
-
-
-def extract_image_url(card: dict) -> Optional[str]:
-    """Return the best available image URL for the given card record."""
-    image_uris = card.get("image_uris") or {}
-    if image_uris:
-        return image_uris.get("large") or image_uris.get("normal") or image_uris.get("png")
-
-    # Double-faced or modal cards store images on the faces.
-    faces = card.get("card_faces") or []
-    for face in faces:
-        face_uris = face.get("image_uris") or {}
-        if face_uris:
-            return face_uris.get("large") or face_uris.get("normal") or face_uris.get("png")
+def download_image_as_blob(url):
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.content
+    except Exception as e:
+        print(f"Failed to download image {url}: {e}")
     return None
 
+def fetch_cards(limit=None, set_code=None):
+    """
+    Fetches cards from Scryfall.
+    If set_code is provided (e.g., '3ed'), it fetches ONLY that set.
+    Otherwise, it defaults to a general 'Old School' search (1993-1994).
+    """
+    base_url = "https://api.scryfall.com/cards/search"
+    
+    # LOGIC: Choose what to search for
+    if set_code:
+        # User asked for a specific set (e.g., '3ed' for Revised)
+        query = f"e:{set_code} unique:prints"
+        print(f"🔍 Searching specifically for set: {set_code.upper()}...")
+    else:
+        # Default: Search for old cards if no set specified
+        query = "year<=1994 unique:prints"
+        print("🔍 Searching for all cards from 1993-1994...")
 
-def compute_phash(image_bytes: bytes) -> str:
-    """Compute the perceptual hash string for the given image bytes."""
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    return str(imagehash.phash(image))
+    params = {
+        "q": query,
+        "order": "released",
+        "dir": "asc"
+    }
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    count = 0
+    url = base_url
+    
+    while url and (limit is None or count < limit):
+        try:
+            print(f"Downloading page: {url} ...")
+            resp = requests.get(url, params=params)
+            data = resp.json()
+            
+            # Scryfall puts the actual card data in 'data' list
+            if "data" not in data:
+                print("No data found or end of list.")
+                break
 
+            for card in data["data"]:
+                if limit and count >= limit:
+                    break
+                
+                # We only care about cards that have actual images
+                if "image_uris" in card and "normal" in card["image_uris"]:
+                    c_id = card["id"]
+                    name = card["name"]
+                    img_url = card["image_uris"]["normal"]
+                    set_name = card.get("set_name", "Unknown")
+                    s_code = card.get("set", "unk")
 
-def iter_cards(cards: list[dict], limit: Optional[int]) -> Iterable[dict]:
-    """Yield cards up to the specified limit."""
-    if limit is None:
-        yield from cards
-        return
+                    # Check if we already have this specific card ID
+                    c.execute("SELECT id FROM cards WHERE id=?", (c_id,))
+                    if c.fetchone():
+                        print(f"Skipping existing: {name} ({s_code})")
+                        continue
 
-    for card in cards[:limit]:
-        yield card
+                    # Download the image to save in DB
+                    blob = download_image_as_blob(img_url)
+                    if blob:
+                        c.execute("INSERT INTO cards (id, card_name, image_url, set_name, set_code, image_blob) VALUES (?, ?, ?, ?, ?, ?)",
+                                  (c_id, name, img_url, set_name, s_code, blob))
+                        conn.commit()
+                        print(f"Saved: {name} [{s_code}]")
+                        count += 1
+            
+            # Pagination: Get the next page URL
+            if "next_page" in data:
+                url = data["next_page"]
+                params = {} # Clear params because next_page url has them built-in
+            else:
+                break
+                
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            break
 
-
-def index_cards(db_path: str, limit: Optional[int] = 100) -> None:
-    """Main indexing routine."""
-    print("Fetching bulk metadata from Scryfall…")
-    download_uri = fetch_bulk_download_url()
-    print("Downloading Unique Artwork JSON…")
-    cards = download_bulk_cards(download_uri)
-
-    connection = sqlite3.connect(db_path)
-    ensure_schema(connection)
-    cursor = connection.cursor()
-
-    processed = 0
-    for card in tqdm(iter_cards(cards, limit), desc="Indexing cards"):
-        image_url = extract_image_url(card)
-        if not image_url:
-            continue
-
-        image_response = requests.get(image_url, timeout=60)
-        image_response.raise_for_status()
-
-        phash = compute_phash(image_response.content)
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO cards(card_name, set_code, phash)
-            VALUES (?, ?, ?)
-            """,
-            (card.get("name", "Unknown"), card.get("set", ""), phash),
-        )
-        processed += 1
-
-    connection.commit()
-    connection.close()
-    print(f"Indexed {processed} cards into {db_path}.")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a pHash index for card images.")
-    parser.add_argument(
-        "--db-path",
-        default=DEFAULT_DB_PATH,
-        help="Path to the SQLite database to create/update (default: cards.db)",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="Maximum number of cards to process (default: 100). Use a higher value to index all cards.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    index_cards(db_path=args.db_path, limit=args.limit)
-
+    conn.close()
+    print(f"\n✅ Done! Added {count} new cards to the database.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Download Magic cards for Aether Sight")
+    parser.add_argument("--limit", type=int, help="Limit number of cards to download", default=None)
+    parser.add_argument("--set", type=str, help="Download a specific set (e.g., '3ed' for Revised)", default=None)
+    
+    args = parser.parse_args()
+    
+    init_db()
+    fetch_cards(limit=args.limit, set_code=args.set)
