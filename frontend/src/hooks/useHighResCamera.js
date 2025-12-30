@@ -1,19 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+// EDITED: SAFE MODE ENABLED
+// Instead of forcing 4K (which crashes many webcams), we ask for "ideal" 1080p.
+// If the camera can't do 1080p, the browser will gracefully fall back to 720p 
+// instead of failing completely.
 const HIGH_RES_CONSTRAINTS = {
   audio: false,
   video: {
-    width: { ideal: 3840 },
-    height: { ideal: 2160 },
+    width: { ideal: 1920 }, // Changed from 3840 (4K) to 1920 (1080p)
+    height: { ideal: 1080 }, // Changed from 2160 (4K) to 1080 (1080p)
     frameRate: { ideal: 30 },
-    facingMode: "environment",
+    facingMode: "environment", // Prefers back camera on phones
   },
 };
 
 /**
  * Request and manage a high-resolution camera stream.
  *
- * The hook tries to obtain a 4K stream and returns helpers for starting/stopping
+ * The hook tries to obtain a stream and returns helpers for starting/stopping
  * the camera alongside the active stream and any surfaced errors.
  */
 export default function useHighResCamera() {
@@ -45,6 +49,7 @@ export default function useHighResCamera() {
       }
       setStream(mediaStream);
     } catch (err) {
+      console.error("Camera Error:", err); // Added logging to help debug
       setError(err instanceof Error ? err : new Error("Unable to start camera"));
     } finally {
       pendingRequest.current = null;
