@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from PIL import Image
 
 DATABASE_PATH = "cards.db"
-HAMMING_THRESHOLD = 12
+HAMMING_THRESHOLD = 8
 
 
 class AnalyzeRequest(BaseModel):
