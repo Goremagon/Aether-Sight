@@ -88,7 +88,7 @@ Usage: python indexer.py [--limit N]
 frontend/src/hooks/useHighResCamera.js
 A custom React hook that interacts with the browser's MediaDevices API. It specifically requests 4K resolution constraints ({ width: 3840, height: 2160 }) and manages the stream lifecycle (start/stop) and error handling.
 
-📄 License :GNU GPLv3
+📄 License :GNU AGPL v3
 
 ## ⚖️ Legal & Disclaimers
 

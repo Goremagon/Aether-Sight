@@ -1,5 +1,15 @@
+# Python
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
 .venv/
+backend/.venv/
+
+# Database (Don't upload the 100MB database, let users build it)
+*.db
+cards.db
+
+# Node / React
 node_modules/
+dist/
+build/
+.env
