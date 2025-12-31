@@ -5,6 +5,9 @@ import sqlite3
 import cv2
 import numpy as np
 import base64
+import imagehash
+from PIL import Image
+from io import BytesIO
 
 app = FastAPI()
 
@@ -18,115 +21,158 @@ app.add_middleware(
 
 # --- CONFIG ---
 DB_PATH = "cards.db"
-MIN_MATCH_COUNT = 15
+# Now that input is clean, we can demand a high quality match
+MIN_ORB_MATCHES = 25       
+PHASH_VERIFY_THRESHOLD = 35 
 
-# NEW REQUEST FORMAT (Includes Target Coordinates)
 class AnalyzeRequest(BaseModel):
     image: str
     target_x: float
     target_y: float
+    box_scale: float
 
-class CardIdentifier:
+class HybridIdentifier:
     def __init__(self):
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self.orb = cv2.ORB_create(nfeatures=2000)
+        # 3000 features is the sweet spot for speed/accuracy
+        self.orb = cv2.ORB_create(nfeatures=3000) 
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        # Standard contrast
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
         self.cards = self._load_cards()
-        print(f"✅ Brain Loaded: {len(self.cards)} cards with Target Lock.")
+        print(f"✅ Brain Loaded: {len(self.cards)} cards.")
+
+    def _get_dominant_color_hash(self, img_bgr):
+        avg = cv2.resize(img_bgr, (1, 1))
+        return avg[0][0]
 
     def _load_cards(self):
         cursor = self.conn.cursor()
+        loaded = []
         try:
             cursor.execute("SELECT card_name, set_code, image_blob FROM cards")
-        except sqlite3.OperationalError:
-            print("❌ Database Error: Table not found.")
-            return []
-
-        loaded = []
-        for name, set_code, blob in cursor.fetchall():
-            if blob:
-                try:
+            for name, set_code, blob in cursor.fetchall():
+                if blob:
                     nparr = np.frombuffer(blob, np.uint8)
-                    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-                    kp, des = self.orb.detectAndCompute(img, None)
+                    color_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    # Pre-compute features for the DB
+                    gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+                    kp, des = self.orb.detectAndCompute(gray_img, None)
+                    
+                    pil_img = Image.open(BytesIO(blob))
+                    phash = imagehash.phash(pil_img)
+                    color_hash = self._get_dominant_color_hash(color_img)
+
                     if des is not None:
-                        loaded.append({"name": name, "set": set_code, "des": des})
-                except:
-                    continue
+                        loaded.append({
+                            "name": name, "set": set_code, "des": des,
+                            "phash": phash, "color": color_hash
+                        })
+        except Exception as e:
+            print(f"Database Error: {e}")
         return loaded
 
-    def _find_targeted_card(self, img, click_x_pct, click_y_pct):
-        height, width = img.shape
-        click_x = int(click_x_pct * width)
-        click_y = int(click_y_pct * height)
+    def _get_sniper_crop(self, user_img, click_x_pct, click_y_pct, box_scale):
+        """
+        Extracts the exact Red Box area from the user's screen.
+        """
+        h, w = user_img.shape[:2]
+        center_x = int(click_x_pct * w)
+        center_y = int(click_y_pct * h)
         
-        # 1. Blur & Threshold
-        blurred = cv2.GaussianBlur(img, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 140, 255, cv2.THRESH_BINARY)
+        # Calculate size based on Frontend Box Scale
+        box_w = int(w * box_scale)
+        box_h = int(box_w / 0.716)
         
-        # 2. Find Contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        x1 = max(0, center_x - box_w // 2)
+        y1 = max(0, center_y - box_h // 2)
+        x2 = min(w, center_x + box_w // 2)
+        y2 = min(h, center_y + box_h // 2)
         
-        for c in contours:
-            x, y, w, h = cv2.boundingRect(c)
-            if w < 50 or h < 50: continue
+        return user_img[y1:y2, x1:x2]
 
-            # HIT TEST: Did user click this box?
-            if x <= click_x <= x + w and y <= click_y <= y + h:
-                print(f"🎯 CLICK HIT! Found card at [{x},{y}]")
-                return img[y:y+h, x:x+w]
-        
-        print("❌ Click missed. Scanning full image as backup.")
-        return img
-
-    def identify(self, user_image_base64, target_x, target_y):
+    def identify(self, user_image_base64, target_x, target_y, box_scale):
         if "," in user_image_base64:
             user_image_base64 = user_image_base64.split(",")[1]
         
-        try:
-            image_data = base64.b64decode(user_image_base64)
-            nparr = np.frombuffer(image_data, np.uint8)
-            user_img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        except Exception:
+        # 1. Decode
+        image_data = base64.b64decode(user_image_base64)
+        nparr = np.frombuffer(image_data, np.uint8)
+        user_img_color = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        # 2. SNIPER CROP (Get the perfect card image)
+        crop_color = self._get_sniper_crop(user_img_color, target_x, target_y, box_scale)
+        
+        # 3. DEBUG: Save it so we know what we are matching against
+        cv2.imwrite("last_match_input.jpg", crop_color)
+        print("💾 Saved Crop to 'last_match_input.jpg'")
+
+        # 4. PREPARE FOR MATCHING
+        # Enhance contrast to help seeing through glare
+        lab = cv2.cvtColor(crop_color, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = self.clahe.apply(l)
+        enhanced_color = cv2.merge((l, a, b))
+        enhanced_color = cv2.cvtColor(enhanced_color, cv2.COLOR_LAB2BGR)
+        
+        crop_gray = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2GRAY)
+        user_color = self._get_dominant_color_hash(crop_color)
+        
+        # Calculate pHash
+        crop_pil = Image.fromarray(crop_gray)
+        crop_phash = imagehash.phash(crop_pil)
+
+        # 5. RUN MATCHING
+        kp, user_des = self.orb.detectAndCompute(crop_gray, None)
+        if user_des is None: 
+            print("⚠️ No features found in crop (Too blurry?)")
             return {"match": False}
 
-        # STEP 1: CROP TO TARGET
-        zoomed_img = self._find_targeted_card(user_img, target_x, target_y)
-
-        # STEP 2: SCAN
-        kp, user_des = self.orb.detectAndCompute(zoomed_img, None)
-        if user_des is None: return {"match": False}
-
         best_match = None
-        max_good_matches = 0
-        bad_moon_score = 0
+        max_matches = 0
 
         for card in self.cards:
             if card["des"] is None: continue
             try:
+                # Compare features
                 matches = self.matcher.knnMatch(card["des"], user_des, k=2)
-                good = []
-                for m, n in matches:
-                    if m.distance < 0.75 * n.distance:
-                        good.append(m)
-                
+                good = [m for m, n in matches if m.distance < 0.75 * n.distance]
                 score = len(good)
-                if score > max_good_matches:
-                    max_good_matches = score
+
+                # Color Safety Check (Prevent Black vs Red errors)
+                db_color = card["color"]
+                diff_b = int(user_color[0]) - int(db_color[0])
+                diff_g = int(user_color[1]) - int(db_color[1])
+                diff_r = int(user_color[2]) - int(db_color[2])
+                color_dist = np.sqrt(diff_b**2 + diff_g**2 + diff_r**2)
+                
+                # If colors are very different, penalize score
+                if color_dist > 100: 
+                    score = int(score * 0.4)
+
+                if score > max_matches:
+                    max_matches = score
                     best_match = card
-                if "Bad Moon" in card["name"]:
-                    bad_moon_score = score
             except: continue
 
-        print(f"🔎 TARGET SCAN: Best: {best_match['name']} ({max_good_matches}) | Bad Moon: {bad_moon_score}")
+        # 6. VERIFY AND RETURN
+        if best_match and max_matches >= MIN_ORB_MATCHES:
+            phash_diff = crop_phash - best_match["phash"]
+            print(f"🔹 Top Match: {best_match['name']} (Score: {max_matches}) | Shape Diff: {phash_diff}")
 
-        if best_match and max_good_matches >= MIN_MATCH_COUNT:
+            # Shape Verification
+            if phash_diff > PHASH_VERIFY_THRESHOLD:
+                print(f"❌ VETO: Matches art but wrong shape (Diff {phash_diff}).")
+                return {"match": False}
+            
             return {"match": True, "card": best_match["name"]}
         
+        print(f"⚠️ No good match found. Best was {best_match['name'] if best_match else 'None'} ({max_matches})")
         return {"match": False}
 
-identifier = CardIdentifier()
+identifier = HybridIdentifier()
 
 @app.post("/analyze")
 async def analyze_card(request: AnalyzeRequest):
-    return identifier.identify(request.image, request.target_x, request.target_y)
+    return identifier.identify(request.image, request.target_x, request.target_y, request.box_scale)
