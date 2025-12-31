@@ -14,3 +14,4 @@ dist/
 build/
 .env
 *.db
+backend/cards.db
