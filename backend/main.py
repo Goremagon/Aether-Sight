@@ -50,6 +50,12 @@ class HybridIdentifier:
         self.cards = self._load_cards()
         print(f"? Brain Loaded: {len(self.cards)} cards.")
 
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
     def _calc_color_hist(self, img_bgr):
         hist = cv2.calcHist(
             [img_bgr], [0, 1, 2], None, COLOR_HIST_BINS,
@@ -187,6 +193,10 @@ class HybridIdentifier:
         return {"match": False}
 
 identifier = HybridIdentifier()
+
+@app.on_event("shutdown")
+def shutdown_event():
+    identifier.close()
 
 @app.post("/analyze")
 async def analyze_card(request: AnalyzeRequest):
