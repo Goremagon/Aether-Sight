@@ -165,7 +165,7 @@ export default function GameRoom() {
     const base64 = canvas.toDataURL("image/png").split(",")[1];
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/analyze", {
+      const res = await fetch("/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
