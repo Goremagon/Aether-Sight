@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import subprocess
+import platform
 
 
 RESET = "\x1b[0m"
@@ -39,7 +40,7 @@ def ensure_required_paths():
         sys.exit(1)
 
 
-def start_process(cmd, cwd):
+def start_process(cmd, cwd, shell=False):
     return subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -47,12 +48,14 @@ def start_process(cmd, cwd):
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        shell=shell,
     )
 
 
 def main():
     ensure_required_paths()
 
+    is_windows = platform.system() == "Windows"
     backend_cmd = [
         sys.executable,
         "-m",
@@ -64,10 +67,15 @@ def main():
         "8000",
         "--reload",
     ]
-    frontend_cmd = ["npm", "start"]
+    if is_windows:
+        frontend_cmd = ["npm.cmd", "start"]
+        frontend_shell = False
+    else:
+        frontend_cmd = ["npm", "start"]
+        frontend_shell = False
 
     backend_proc = start_process(backend_cmd, cwd="backend")
-    frontend_proc = start_process(frontend_cmd, cwd="frontend")
+    frontend_proc = start_process(frontend_cmd, cwd="frontend", shell=frontend_shell)
 
     threads = [
         threading.Thread(
