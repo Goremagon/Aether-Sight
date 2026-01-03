@@ -7,13 +7,13 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import sqlite3
+import os
+import pickle
 import cv2
 import numpy as np
 import base64
 import imagehash
 from PIL import Image
-from io import BytesIO
 
 app = FastAPI()
 
@@ -26,7 +26,7 @@ app.add_middleware(
 )
 
 # --- CONFIG ---
-DB_PATH = "cards.db"
+BRAIN_PATH = "brain.pkl"
 # Now that input is clean, we can demand a high quality match
 MIN_ORB_MATCHES = 40
 PHASH_VERIFY_THRESHOLD = 35
@@ -41,54 +41,42 @@ class AnalyzeRequest(BaseModel):
 
 class HybridIdentifier:
     def __init__(self):
-        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         # 3000 features is the sweet spot for speed/accuracy
         self.orb = cv2.ORB_create(nfeatures=3000)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         # Standard contrast
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
-        self.cards = self._load_cards()
+        self.cards = self._load_brain()
         print(f"? Brain Loaded: {len(self.cards)} cards.")
 
     def close(self):
-        try:
-            self.conn.close()
-        except Exception:
-            pass
+        pass
 
     def _calc_color_hist(self, img_bgr):
+        h, w = img_bgr.shape[:2]
+        crop_w = max(1, int(w * 0.6))
+        crop_h = max(1, int(h * 0.6))
+        x1 = (w - crop_w) // 2
+        y1 = (h - crop_h) // 2
+        x2 = x1 + crop_w
+        y2 = y1 + crop_h
+        center = img_bgr[y1:y2, x1:x2]
         hist = cv2.calcHist(
-            [img_bgr], [0, 1, 2], None, COLOR_HIST_BINS,
+            [center], [0, 1, 2], None, COLOR_HIST_BINS,
             [0, 256, 0, 256, 0, 256]
         )
         return cv2.normalize(hist, hist).flatten()
 
-    def _load_cards(self):
-        cursor = self.conn.cursor()
-        loaded = []
+    def _load_brain(self):
+        if not os.path.exists(BRAIN_PATH):
+            print("❌ Brain not found. Please run 'python compile_brain.py' first.")
+            return []
         try:
-            cursor.execute("SELECT card_name, set_code, image_blob FROM cards")
-            for name, set_code, blob in cursor.fetchall():
-                if blob:
-                    nparr = np.frombuffer(blob, np.uint8)
-                    color_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-                    # Pre-compute features for the DB
-                    gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
-                    kp, des = self.orb.detectAndCompute(gray_img, None)
-                    color_hist = self._calc_color_hist(color_img)
-
-                    pil_img = Image.open(BytesIO(blob))
-                    phash = imagehash.phash(pil_img)
-
-                    if des is not None:
-                        loaded.append({
-                            "name": name, "set": set_code, "des": des,
-                            "phash": phash, "hist": color_hist
-                        })
+            with open(BRAIN_PATH, "rb") as f:
+                return pickle.load(f)
         except Exception as e:
-            print(f"Database Error: {e}")
-        return loaded
+            print(f"Brain Load Error: {e}")
+            return []
 
     def _get_sniper_crop(self, user_img, click_x_pct, click_y_pct, box_scale):
         """
