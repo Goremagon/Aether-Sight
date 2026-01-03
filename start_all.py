@@ -68,10 +68,10 @@ def main():
         "--reload",
     ]
     if is_windows:
-        frontend_cmd = ["npm.cmd", "start"]
+        frontend_cmd = ["npm.cmd", "run", "dev"]
         frontend_shell = False
     else:
-        frontend_cmd = ["npm", "start"]
+        frontend_cmd = ["npm", "run", "dev"]
         frontend_shell = False
 
     backend_proc = start_process(backend_cmd, cwd="backend")
