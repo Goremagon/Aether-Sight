@@ -4,8 +4,10 @@
 # by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-import sqlite3
+import multiprocessing
+import os
 import pickle
+import sqlite3
 from io import BytesIO
 
 import cv2
@@ -43,68 +45,60 @@ def _calc_color_hist(img_bgr):
     return cv2.normalize(hist, hist).flatten()
 
 
-def _iter_with_progress(rows, total):
-    if tqdm:
-        return tqdm(rows, total=total, unit="card")
+def process_card(card_tuple):
+    name, set_code, blob = card_tuple
+    if not blob:
+        return None
 
-    def generator():
-        count = 0
-        for row in rows:
-            count += 1
-            if total:
-                if count == 1 or count == total or count % 500 == 0:
-                    print(f"Processed {count}/{total}")
-            elif count == 1 or count % 500 == 0:
-                print(f"Processed {count}")
-            yield row
+    nparr = np.frombuffer(blob, np.uint8)
+    color_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if color_img is None:
+        return None
 
-    return generator()
-
-
-def main():
-    conn = sqlite3.connect(DB_PATH)
+    gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
     orb = cv2.ORB_create(nfeatures=3000)
+    _, des = orb.detectAndCompute(gray_img, None)
+    if des is None:
+        return None
 
-    count_cursor = conn.cursor()
-    count_cursor.execute("SELECT COUNT(*) FROM cards")
-    total = count_cursor.fetchone()[0] or 0
-
-    cursor = conn.cursor()
-    cursor.execute("SELECT card_name, set_code, image_blob FROM cards")
-
-    brain = []
-    for name, set_code, blob in _iter_with_progress(cursor, total):
-        if not blob:
-            continue
-
-        nparr = np.frombuffer(blob, np.uint8)
-        color_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if color_img is None:
-            continue
-
-        gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
-        _, des = orb.detectAndCompute(gray_img, None)
-        if des is None:
-            continue
-
+    try:
         color_hist = _calc_color_hist(color_img)
         pil_img = Image.open(BytesIO(blob))
         phash = imagehash.phash(pil_img)
+    except Exception:
+        return None
 
-        brain.append({
-            "name": name,
-            "set_code": set_code,
-            "des": des,
-            "hist": color_hist,
-            "phash": phash,
-        })
+    return {
+        "name": name,
+        "set_code": set_code,
+        "des": des,
+        "hist": color_hist,
+        "phash": phash,
+    }
+
+
+if __name__ == "__main__":
+    num_workers = max(1, os.cpu_count() // 2)
+    print(f"🚀 Starting compilation with {num_workers} cores...")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    all_rows = cursor.execute(
+        "SELECT card_name, set_code, image_blob FROM cards"
+    ).fetchall()
+    conn.close()
+
+    brain = []
+    with multiprocessing.Pool(num_workers) as pool:
+        results = pool.imap_unordered(process_card, all_rows, chunksize=50)
+        if tqdm:
+            results = tqdm(results, total=len(all_rows), unit="card")
+        for result in results:
+            if result is not None:
+                brain.append(result)
 
     with open(BRAIN_PATH, "wb") as f:
         pickle.dump(brain, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    conn.close()
     print(f"Brain compiled: {len(brain)} cards -> {BRAIN_PATH}")
 
-
-if __name__ == "__main__":
-    main()
