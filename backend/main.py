@@ -28,7 +28,7 @@ app.add_middleware(
 # --- CONFIG ---
 BRAIN_PATH = "brain.pkl"
 # Now that input is clean, we can demand a high quality match
-MIN_ORB_MATCHES = 40
+MIN_ORB_MATCHES = 15
 PHASH_VERIFY_THRESHOLD = 35
 COLOR_HIST_BINS = (8, 8, 8)
 COLOR_CORR_THRESHOLD = 0.5
@@ -39,10 +39,20 @@ class AnalyzeRequest(BaseModel):
     target_y: float
     box_scale: float
 
+def get_center_crop(img_bgr, crop_pct=0.6):
+    h, w = img_bgr.shape[:2]
+    crop_w = max(1, int(w * crop_pct))
+    crop_h = max(1, int(h * crop_pct))
+    x1 = (w - crop_w) // 2
+    y1 = (h - crop_h) // 2
+    x2 = x1 + crop_w
+    y2 = y1 + crop_h
+    return img_bgr[y1:y2, x1:x2]
+
 class HybridIdentifier:
     def __init__(self):
         # 3000 features is the sweet spot for speed/accuracy
-        self.orb = cv2.ORB_create(nfeatures=3000)
+        self.orb = cv2.ORB_create(nfeatures=1000)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         # Standard contrast
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
@@ -53,14 +63,7 @@ class HybridIdentifier:
         pass
 
     def _calc_color_hist(self, img_bgr):
-        h, w = img_bgr.shape[:2]
-        crop_w = max(1, int(w * 0.6))
-        crop_h = max(1, int(h * 0.6))
-        x1 = (w - crop_w) // 2
-        y1 = (h - crop_h) // 2
-        x2 = x1 + crop_w
-        y2 = y1 + crop_h
-        center = img_bgr[y1:y2, x1:x2]
+        center = get_center_crop(img_bgr, 0.6)
         hist = cv2.calcHist(
             [center], [0, 1, 2], None, COLOR_HIST_BINS,
             [0, 256, 0, 256, 0, 256]

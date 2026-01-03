@@ -23,9 +23,10 @@ except Exception:
 DB_PATH = "cards.db"
 BRAIN_PATH = "brain.pkl"
 COLOR_HIST_BINS = (8, 8, 8)
+N_FEATURES = 1000
 
 
-def _center_crop(img_bgr, crop_pct=0.6):
+def get_center_crop(img_bgr, crop_pct=0.6):
     h, w = img_bgr.shape[:2]
     crop_w = max(1, int(w * crop_pct))
     crop_h = max(1, int(h * crop_pct))
@@ -37,7 +38,7 @@ def _center_crop(img_bgr, crop_pct=0.6):
 
 
 def _calc_color_hist(img_bgr):
-    center = _center_crop(img_bgr, 0.6)
+    center = get_center_crop(img_bgr, 0.6)
     hist = cv2.calcHist(
         [center], [0, 1, 2], None, COLOR_HIST_BINS,
         [0, 256, 0, 256, 0, 256]
@@ -56,7 +57,7 @@ def process_card(card_tuple):
         return None
 
     gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
-    orb = cv2.ORB_create(nfeatures=3000)
+    orb = cv2.ORB_create(nfeatures=N_FEATURES)
     _, des = orb.detectAndCompute(gray_img, None)
     if des is None:
         return None
