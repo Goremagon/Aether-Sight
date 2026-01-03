@@ -114,8 +114,12 @@ export default function GameRoom() {
         if (videoRef.current) videoRef.current.srcObject = mediaStream;
       } catch (err) { console.error("Camera Error:", err); }
     }
+    document.body.style.overflow = "hidden";
     startCamera();
-    return () => { if (stream) stream.getTracks().forEach(track => track.stop()); };
+    return () => { 
+      document.body.style.overflow = "";
+      if (stream) stream.getTracks().forEach(track => track.stop()); 
+    };
   }, []);
 
   // Handle Scroll to Resize Box

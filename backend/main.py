@@ -14,6 +14,7 @@ import numpy as np
 import base64
 import imagehash
 from PIL import Image
+import time
 
 app = FastAPI()
 
@@ -27,11 +28,11 @@ app.add_middleware(
 
 # --- CONFIG ---
 BRAIN_PATH = "brain.pkl"
-# Now that input is clean, we can demand a high quality match
-MIN_ORB_MATCHES = 15
+N_FEATURES = 250
+MIN_MATCHES = 8
 PHASH_VERIFY_THRESHOLD = 35
 COLOR_HIST_BINS = (8, 8, 8)
-COLOR_CORR_THRESHOLD = 0.5
+COLOR_THRESHOLD = 0.30
 
 class AnalyzeRequest(BaseModel):
     image: str
@@ -39,7 +40,7 @@ class AnalyzeRequest(BaseModel):
     target_y: float
     box_scale: float
 
-def get_center_crop(img_bgr, crop_pct=0.6):
+def get_center_crop(img_bgr, crop_pct=0.5):
     h, w = img_bgr.shape[:2]
     crop_w = max(1, int(w * crop_pct))
     crop_h = max(1, int(h * crop_pct))
@@ -51,8 +52,7 @@ def get_center_crop(img_bgr, crop_pct=0.6):
 
 class HybridIdentifier:
     def __init__(self):
-        # 3000 features is the sweet spot for speed/accuracy
-        self.orb = cv2.ORB_create(nfeatures=1000)
+        self.orb = cv2.ORB_create(nfeatures=N_FEATURES)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         # Standard contrast
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
@@ -63,7 +63,7 @@ class HybridIdentifier:
         pass
 
     def _calc_color_hist(self, img_bgr):
-        center = get_center_crop(img_bgr, 0.6)
+        center = get_center_crop(img_bgr, 0.5)
         hist = cv2.calcHist(
             [center], [0, 1, 2], None, COLOR_HIST_BINS,
             [0, 256, 0, 256, 0, 256]
@@ -101,6 +101,7 @@ class HybridIdentifier:
         return user_img[y1:y2, x1:x2]
 
     def identify(self, user_image_base64, target_x, target_y, box_scale):
+        search_start = time.perf_counter()
         if "," in user_image_base64:
             user_image_base64 = user_image_base64.split(",")[1]
 
@@ -144,7 +145,6 @@ class HybridIdentifier:
             if card["des"] is None:
                 continue
             try:
-                # Compare features
                 matches = self.matcher.knnMatch(card["des"], user_des, k=2)
                 good = [m for m, n in matches if m.distance < 0.75 * n.distance]
                 score = len(good)
@@ -156,12 +156,14 @@ class HybridIdentifier:
                 continue
 
         # 6. VERIFY AND RETURN
-        if best_match and max_matches >= MIN_ORB_MATCHES:
+        if best_match and max_matches >= MIN_MATCHES:
             color_corr = cv2.compareHist(
                 crop_hist, best_match["hist"], cv2.HISTCMP_CORREL
             )
-            if color_corr < COLOR_CORR_THRESHOLD:
+            if color_corr < COLOR_THRESHOLD:
                 print(f"? VETO: ORB match but color mismatch (Corr {color_corr:.2f}).")
+                elapsed_ms = (time.perf_counter() - search_start) * 1000
+                print(f"⏱️ Search took {elapsed_ms:.2f} ms")
                 return {"match": False}
 
             phash_diff = crop_phash - best_match["phash"]
@@ -173,14 +175,20 @@ class HybridIdentifier:
             # Shape Verification
             if phash_diff > PHASH_VERIFY_THRESHOLD:
                 print(f"? VETO: Matches art but wrong shape (Diff {phash_diff}).")
+                elapsed_ms = (time.perf_counter() - search_start) * 1000
+                print(f"⏱️ Search took {elapsed_ms:.2f} ms")
                 return {"match": False}
 
+            elapsed_ms = (time.perf_counter() - search_start) * 1000
+            print(f"⏱️ Search took {elapsed_ms:.2f} ms")
             return {"match": True, "card": best_match["name"]}
 
         print(
             f"?? No good match found. Best was "
             f"{best_match['name'] if best_match else 'None'} ({max_matches})"
         )
+        elapsed_ms = (time.perf_counter() - search_start) * 1000
+        print(f"⏱️ Search took {elapsed_ms:.2f} ms")
         return {"match": False}
 
 identifier = HybridIdentifier()
