@@ -57,7 +57,7 @@ class HybridIdentifier:
         # Standard contrast
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
         self.cards = self._load_brain()
-        print(f"? Brain Loaded: {len(self.cards)} cards.")
+        print(f"[INFO] Brain Loaded: {len(self.cards)} cards.")
 
     def close(self):
         pass
@@ -72,7 +72,7 @@ class HybridIdentifier:
 
     def _load_brain(self):
         if not os.path.exists(BRAIN_PATH):
-            print("❌ Brain not found. Please run 'python compile_brain.py' first.")
+            print("[ERROR] Brain not found. Please run 'python compile_brain.py' first.")
             return []
         try:
             with open(BRAIN_PATH, "rb") as f:
@@ -115,7 +115,7 @@ class HybridIdentifier:
 
         # 3. DEBUG: Save it so we know what we are matching against
         cv2.imwrite("last_match_input.jpg", crop_color)
-        print("?? Saved Crop to 'last_match_input.jpg'")
+        print("[DEBUG] Saved Crop to 'last_match_input.jpg'")
 
         # 4. PREPARE FOR MATCHING
         # Enhance contrast to help seeing through glare
@@ -135,7 +135,7 @@ class HybridIdentifier:
         # 5. RUN MATCHING
         kp, user_des = self.orb.detectAndCompute(crop_gray, None)
         if user_des is None:
-            print("?? No features found in crop (Too blurry?)")
+            print("[WARN] No features found in crop (Too blurry?)")
             return {"match": False}
 
         best_match = None
@@ -161,34 +161,34 @@ class HybridIdentifier:
                 crop_hist, best_match["hist"], cv2.HISTCMP_CORREL
             )
             if color_corr < COLOR_THRESHOLD:
-                print(f"? VETO: ORB match but color mismatch (Corr {color_corr:.2f}).")
+                print(f"[VETO] ORB match but color mismatch (Corr {color_corr:.2f}).")
                 elapsed_ms = (time.perf_counter() - search_start) * 1000
-                print(f"⏱️ Search took {elapsed_ms:.2f} ms")
+                print(f"[TIME] Search took {elapsed_ms:.2f} ms")
                 return {"match": False}
 
             phash_diff = crop_phash - best_match["phash"]
             print(
-                f"?? Top Match: {best_match['name']} (Score: {max_matches}) | "
+                f"[MATCH] Top Match: {best_match['name']} (Score: {max_matches}) | "
                 f"Shape Diff: {phash_diff}"
             )
 
             # Shape Verification
             if phash_diff > PHASH_VERIFY_THRESHOLD:
-                print(f"? VETO: Matches art but wrong shape (Diff {phash_diff}).")
+                print(f"[VETO] Matches art but wrong shape (Diff {phash_diff}).")
                 elapsed_ms = (time.perf_counter() - search_start) * 1000
-                print(f"⏱️ Search took {elapsed_ms:.2f} ms")
+                print(f"[TIME] Search took {elapsed_ms:.2f} ms")
                 return {"match": False}
 
             elapsed_ms = (time.perf_counter() - search_start) * 1000
-            print(f"⏱️ Search took {elapsed_ms:.2f} ms")
+            print(f"[TIME] Search took {elapsed_ms:.2f} ms")
             return {"match": True, "card": best_match["name"]}
 
         print(
-            f"?? No good match found. Best was "
+            f"[FAIL] No good match found. Best was "
             f"{best_match['name'] if best_match else 'None'} ({max_matches})"
         )
         elapsed_ms = (time.perf_counter() - search_start) * 1000
-        print(f"⏱️ Search took {elapsed_ms:.2f} ms")
+        print(f"[TIME] Search took {elapsed_ms:.2f} ms")
         return {"match": False}
 
 identifier = HybridIdentifier()
