@@ -28,11 +28,12 @@ app.add_middleware(
 
 # --- CONFIG ---
 BRAIN_PATH = "brain.pkl"
-N_FEATURES = 250
-MIN_MATCHES = 8
-PHASH_VERIFY_THRESHOLD = 35
+N_FEATURES = 1000
+MIN_MATCHES = 15
+PHASH_VERIFY_THRESHOLD = 30
 COLOR_HIST_BINS = (8, 8, 8)
 COLOR_THRESHOLD = 0.30
+ART_CROP_PCT = 0.7
 
 class AnalyzeRequest(BaseModel):
     image: str
@@ -63,7 +64,7 @@ class HybridIdentifier:
         pass
 
     def _calc_color_hist(self, img_bgr):
-        center = get_center_crop(img_bgr, 0.5)
+        center = get_center_crop(img_bgr, ART_CROP_PCT)
         hist = cv2.calcHist(
             [center], [0, 1, 2], None, COLOR_HIST_BINS,
             [0, 256, 0, 256, 0, 256]
@@ -119,14 +120,15 @@ class HybridIdentifier:
 
         # 4. PREPARE FOR MATCHING
         # Enhance contrast to help seeing through glare
-        lab = cv2.cvtColor(crop_color, cv2.COLOR_BGR2LAB)
+        art_crop = get_center_crop(crop_color, ART_CROP_PCT)
+        lab = cv2.cvtColor(art_crop, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l = self.clahe.apply(l)
         enhanced_color = cv2.merge((l, a, b))
         enhanced_color = cv2.cvtColor(enhanced_color, cv2.COLOR_LAB2BGR)
 
         crop_gray = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2GRAY)
-        crop_hist = self._calc_color_hist(crop_color)
+        crop_hist = self._calc_color_hist(enhanced_color)
 
         # Calculate pHash
         crop_pil = Image.fromarray(crop_gray)
@@ -138,15 +140,28 @@ class HybridIdentifier:
             print("[WARN] No features found in crop (Too blurry?)")
             return {"match": False}
 
+        phash_candidates = []
+        for card in self.cards:
+            if card.get("phash") is None:
+                continue
+            phash_diff = crop_phash - card["phash"]
+            phash_candidates.append((phash_diff, card))
+
+        phash_candidates.sort(key=lambda item: item[0])
+        top_candidates = [
+            card for diff, card in phash_candidates
+            if diff <= PHASH_VERIFY_THRESHOLD
+        ][:30]
+
         best_match = None
         max_matches = 0
 
-        for card in self.cards:
+        for card in top_candidates:
             if card["des"] is None:
                 continue
             try:
                 matches = self.matcher.knnMatch(card["des"], user_des, k=2)
-                good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+                good = [m for m, n in matches if m.distance < 0.70 * n.distance]
                 score = len(good)
 
                 if score > max_matches:
