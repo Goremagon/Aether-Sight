@@ -8,8 +8,6 @@ import multiprocessing
 import os
 import pickle
 import sqlite3
-from io import BytesIO
-
 import cv2
 import numpy as np
 import imagehash
@@ -24,6 +22,7 @@ DB_PATH = "cards.db"
 BRAIN_PATH = "brain.pkl"
 COLOR_HIST_BINS = (8, 8, 8)
 N_FEATURES = 250
+ART_CROP_PCT = 0.7
 
 
 def get_center_crop(img_bgr, crop_pct=0.5):
@@ -38,7 +37,7 @@ def get_center_crop(img_bgr, crop_pct=0.5):
 
 
 def _calc_color_hist(img_bgr):
-    center = get_center_crop(img_bgr, 0.5)
+    center = get_center_crop(img_bgr, ART_CROP_PCT)
     hist = cv2.calcHist(
         [center], [0, 1, 2], None, COLOR_HIST_BINS,
         [0, 256, 0, 256, 0, 256]
@@ -56,15 +55,22 @@ def process_card(card_tuple):
     if color_img is None:
         return None
 
-    gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+    art_crop = get_center_crop(color_img, ART_CROP_PCT)
+    lab = cv2.cvtColor(art_crop, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    l = clahe.apply(l)
+    enhanced_color = cv2.merge((l, a, b))
+    enhanced_color = cv2.cvtColor(enhanced_color, cv2.COLOR_LAB2BGR)
+    gray_img = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2GRAY)
     orb = cv2.ORB_create(nfeatures=N_FEATURES)
     _, des = orb.detectAndCompute(gray_img, None)
     if des is None:
         return None
 
     try:
-        color_hist = _calc_color_hist(color_img)
-        pil_img = Image.open(BytesIO(blob))
+        color_hist = _calc_color_hist(enhanced_color)
+        pil_img = Image.fromarray(gray_img)
         phash = imagehash.phash(pil_img)
     except Exception:
         return None
@@ -102,4 +108,3 @@ if __name__ == "__main__":
         pickle.dump(brain, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     print(f"Brain compiled: {len(brain)} cards -> {BRAIN_PATH}")
-
