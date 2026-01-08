@@ -1,426 +1,23 @@
-"""
-Host Engine vision API with HSV-first filtering and FLANN ORB matching.
-"""
+# Copyright (C) 2025 Goremagon
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 
-from __future__ import annotations
-
-import argparse
-import base64
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import pickle
-import socket
-import sqlite3
-import threading
-import time
-from dataclasses import dataclass
-from typing import Optional
-
 import cv2
 import numpy as np
-import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import base64
+import imagehash
+from PIL import Image
+import time
 
-N_FEATURES = 2000
-MIN_MATCHES = 25
-HSV_VETO_THRESHOLD = 0.5
-TOP_CANDIDATES = 500
-BRAIN_PATH = "brain.pkl"
-COLLECTION_DB = "user_collection.db"
-BRAIN_DOWNLOAD_URL = "https://example.com/mtg/brain.pkl"
+app = FastAPI()
 
-
-class AnalyzeRequest(BaseModel):
-    image: str
-    mode: str = "play"
-
-
-class LoadDeckRequest(BaseModel):
-    decklist: str
-
-
-def log_server(message: str) -> None:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[SERVER] {timestamp} {message}")
-
-
-def log_client(message: str) -> None:
-    print(f"[CLIENT] {message}")
-
-
-def log_match(message: str) -> None:
-    print(f"[MATCH] {message}")
-
-
-def log_phase2(message: str) -> None:
-    print(f"[PHASE2] {message}")
-
-
-def decode_image(image_data: str) -> bytes:
-    try:
-        return base64.b64decode(image_data, validate=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid base64 image data.") from exc
-
-
-def cleanup_temp_files() -> None:
-    temp_files = ["last_match_input.jpg", f"{BRAIN_PATH}.tmp"]
-    for file_path in temp_files:
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                log_server(f"Removed temp file: {file_path}")
-            except OSError as exc:
-                log_server(f"Failed to remove temp file {file_path}: {exc}")
-
-
-def ensure_assets_ready() -> None:
-    if os.path.exists(BRAIN_PATH):
-        return
-
-    log_server("Brain missing. Downloading pre-optimized MTG fingerprints...")
-    temp_path = f"{BRAIN_PATH}.tmp"
-    try:
-        with requests.get(BRAIN_DOWNLOAD_URL, timeout=60, stream=True) as response:
-            response.raise_for_status()
-            with open(temp_path, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-    except requests.RequestException as exc:
-        log_server(f"Brain download failed: {exc}")
-        raise
-
-    file_size = os.path.getsize(temp_path)
-    if file_size <= 0:
-        os.remove(temp_path)
-        raise RuntimeError("Downloaded brain file is empty.")
-
-    os.replace(temp_path, BRAIN_PATH)
-    log_server(f"Brain ready: {BRAIN_PATH} ({file_size} bytes)")
-
-
-def start_headless_broadcast(port: int, interval: float = 2.0) -> threading.Thread:
-    def broadcast_loop() -> None:
-        message = f"Aether-Sight Host Engine on port {port}".encode("utf-8")
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            while True:
-                sock.sendto(message, ("255.255.255.255", 37020))
-                time.sleep(interval)
-
-    thread = threading.Thread(target=broadcast_loop, daemon=True)
-    thread.start()
-    log_server("Headless broadcast enabled")
-    return thread
-
-
-def order_points(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
-    max_width = int(max(width_a, width_b))
-
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
-    max_height = int(max(height_a, height_b))
-
-    destination = np.array(
-        [
-            [0, 0],
-            [max_width - 1, 0],
-            [max_width - 1, max_height - 1],
-            [0, max_height - 1],
-        ],
-        dtype="float32",
-    )
-
-    transform_matrix = cv2.getPerspectiveTransform(rect, destination)
-    warped = cv2.warpPerspective(image, transform_matrix, (max_width, max_height))
-    return warped
-
-
-def get_center_crop(image: np.ndarray, crop_ratio: float = 0.5) -> np.ndarray:
-    height, width = image.shape[:2]
-    crop_width = int(width * crop_ratio)
-    crop_height = int(height * crop_ratio)
-    start_x = (width - crop_width) // 2
-    start_y = (height - crop_height) // 2
-    return image[start_y : start_y + crop_height, start_x : start_x + crop_width]
-
-
-def apply_clahe(image: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    v = clahe.apply(v)
-    return cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2BGR)
-
-
-def compute_hsv_histogram(image: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 12, 3], [0, 180, 0, 256, 0, 256])
-    hist = cv2.normalize(hist, hist).flatten()
-    return hist.astype(np.float32)
-
-
-def ensure_collection_db() -> None:
-    connection = sqlite3.connect(COLLECTION_DB)
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS collection_hits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            card_name TEXT NOT NULL,
-            set_code TEXT NOT NULL,
-            matches INTEGER NOT NULL,
-            mode TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    connection.commit()
-    connection.close()
-
-
-def log_collection_hit(card_name: str, set_code: str, matches: int, mode: str) -> None:
-    connection = sqlite3.connect(COLLECTION_DB)
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        INSERT INTO collection_hits(card_name, set_code, matches, mode, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (card_name, set_code, matches, mode, time.strftime("%Y-%m-%d %H:%M:%S")),
-    )
-    connection.commit()
-    connection.close()
-
-
-@dataclass
-class Brain:
-    descriptors: np.ndarray
-    descriptor_card_index: np.ndarray
-    card_names: list[str]
-    set_codes: list[str]
-    card_hsv_hist: np.ndarray
-    card_phash: list[str]
-    oracle_texts: list[str]
-    mana_costs: list[str]
-    card_image_urls: list[str]
-
-
-def load_brain(path: str) -> Brain:
-    log_server(f"Loading brain from {path}")
-    with open(path, "rb") as handle:
-        data = pickle.load(handle)
-    return Brain(
-        descriptors=data["descriptors"],
-        descriptor_card_index=data["descriptor_card_index"],
-        card_names=data["card_names"],
-        set_codes=data["set_codes"],
-        card_hsv_hist=data["card_hsv_hist"],
-        card_phash=data["card_phash"],
-        oracle_texts=data["oracle_texts"],
-        mana_costs=data["mana_costs"],
-        card_image_urls=data["card_image_urls"],
-    )
-
-
-class HostEngineIdentifier:
-    def __init__(self, brain_path: str = BRAIN_PATH) -> None:
-        self.orb = cv2.ORB_create(nfeatures=N_FEATURES)
-        self.brain = load_brain(brain_path)
-        index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1)
-        search_params = dict(checks=50)
-        self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
-        self.matcher.add([self.brain.descriptors])
-        self.matcher.train()
-        self.active_deck_indices: Optional[set[int]] = None
-
-    def set_active_deck(self, decklist: str) -> None:
-        names = {line.strip().lower() for line in decklist.splitlines() if line.strip()}
-        if not names:
-            self.active_deck_indices = None
-            log_client("Active deck cleared")
-            return
-        indices = {
-            idx for idx, name in enumerate(self.brain.card_names) if name.lower() in names
-        }
-        self.active_deck_indices = indices if indices else None
-        log_client(f"Active deck loaded: {len(indices)} cards")
-
-    def _find_card_contour(self, edges: np.ndarray) -> Optional[np.ndarray]:
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        for contour in contours:
-            perimeter = cv2.arcLength(contour, True)
-            approximation = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-            if len(approximation) == 4:
-                return approximation.reshape(4, 2)
-        return None
-
-    def _extract_card(self, image: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 75, 200)
-        contour = self._find_card_contour(edges)
-        if contour is None:
-            return image
-        return four_point_transform(image, contour)
-
-    def _confidence_level(self, match_count: int) -> str:
-        if match_count >= 75:
-            return "High"
-        if match_count >= 40:
-            return "Medium"
-        return "Low"
-
-    def _stage_one_candidates(self, hsv_hist: np.ndarray, use_deck: bool) -> list[int]:
-        if use_deck and self.active_deck_indices:
-            indices = np.array(list(self.active_deck_indices), dtype=np.int32)
-            histograms = self.brain.card_hsv_hist[indices]
-        else:
-            indices = np.arange(len(self.brain.card_names))
-            histograms = self.brain.card_hsv_hist
-
-        correlations = np.array(
-            [cv2.compareHist(hsv_hist, candidate, cv2.HISTCMP_CORREL) for candidate in histograms],
-            dtype=np.float32,
-        )
-        top_k = min(TOP_CANDIDATES, len(indices))
-        top_indices = np.argpartition(-correlations, top_k - 1)[:top_k]
-        sorted_indices = top_indices[np.argsort(-correlations[top_indices])]
-        return indices[sorted_indices].tolist()
-
-    def _stage_two_match(
-        self, descriptors: np.ndarray, candidate_indices: list[int], mode: str
-    ) -> tuple[Optional[dict], list[dict]]:
-        matches = self.matcher.knnMatch(descriptors, k=2)
-        good_matches = []
-        for pair in matches:
-            if len(pair) < 2:
-                continue
-            first, second = pair
-            if first.distance < 0.75 * second.distance:
-                good_matches.append(first)
-
-        if not good_matches:
-            log_match("No good matches after ratio test")
-            return None, []
-
-        candidate_set = set(candidate_indices)
-        card_votes = {idx: 0 for idx in candidate_indices}
-        for match in good_matches:
-            card_index = int(self.brain.descriptor_card_index[match.trainIdx])
-            if card_index in candidate_set:
-                card_votes[card_index] += 1
-
-        sorted_candidates = sorted(card_votes.items(), key=lambda item: item[1], reverse=True)
-        best_index, best_count = sorted_candidates[0]
-        log_match(f"Best match {self.brain.card_names[best_index]} with {best_count} matches")
-
-        if best_count < MIN_MATCHES:
-            log_match("Best match below minimum threshold")
-            return None, []
-
-        if mode == "collection":
-            log_collection_hit(
-                self.brain.card_names[best_index], self.brain.set_codes[best_index], best_count, mode
-            )
-
-        candidates_payload = [
-            {
-                "card": self.brain.card_names[idx],
-                "set": self.brain.set_codes[idx],
-                "matches": count,
-                "image_url": self.brain.card_image_urls[idx],
-            }
-            for idx, count in sorted_candidates[:5]
-        ]
-
-        result = {
-            "card": self.brain.card_names[best_index],
-            "set": self.brain.set_codes[best_index],
-            "matches": best_count,
-            "confidence": self._confidence_level(best_count),
-            "oracle_text": self.brain.oracle_texts[best_index],
-            "mana_cost": self.brain.mana_costs[best_index],
-        }
-        return result, candidates_payload
-
-    def identify(self, image_bytes: bytes, mode: str) -> Optional[dict]:
-        np_image = np.frombuffer(image_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
-        if frame is None:
-            raise HTTPException(status_code=400, detail="Could not decode image bytes.")
-
-        card_image = self._extract_card(frame)
-        crop = get_center_crop(card_image, 0.5)
-        if crop.mean() < 5:
-            log_match("Black hole crop detected")
-            return {"match": False, "error": "Black hole crop detected"}
-
-        crop = apply_clahe(crop)
-        hsv_hist = compute_hsv_histogram(crop)
-
-        candidate_indices = self._stage_one_candidates(hsv_hist, use_deck=True)
-        if self.active_deck_indices and not candidate_indices:
-            candidate_indices = self._stage_one_candidates(hsv_hist, use_deck=False)
-        elif not self.active_deck_indices:
-            candidate_indices = self._stage_one_candidates(hsv_hist, use_deck=False)
-
-        if not candidate_indices:
-            log_match("No candidates after HSV stage")
-            return None
-
-        top_candidate = candidate_indices[0]
-        correlation = float(
-            cv2.compareHist(hsv_hist, self.brain.card_hsv_hist[top_candidate], cv2.HISTCMP_CORREL)
-        )
-        log_match(f"HSV correlation {correlation:.3f} for {self.brain.card_names[top_candidate]}")
-        if correlation < HSV_VETO_THRESHOLD:
-            log_match("Rejected by HSV veto")
-            return None
-
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        keypoints, descriptors = self.orb.detectAndCompute(gray, None)
-        if descriptors is None or len(keypoints) == 0:
-            log_match("No descriptors detected")
-            return None
-
-        if mode == "collection":
-            ensure_collection_db()
-            result, candidates = self._stage_two_match(descriptors, candidate_indices, mode)
-            if result:
-                log_phase2("Collection mode semantic hooks ready")
-            return {"match": bool(result), **(result or {}), "candidates": candidates}
-
-        result, candidates = self._stage_two_match(descriptors, candidate_indices, mode)
-        if result:
-            log_phase2("Semantic hooks attached")
-            if result["confidence"] == "Low":
-                return {"match": True, **result, "candidates": candidates}
-            return {"match": True, **result}
-
-        return None
-
-
-app = FastAPI(title="Aether Sight Host Engine", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -429,42 +26,177 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-cleanup_temp_files()
-ensure_assets_ready()
-identifier = HostEngineIdentifier()
+# --- CONFIG ---
+BRAIN_PATH = "brain.pkl"
+N_FEATURES = 250
+MIN_MATCHES = 8
+PHASH_VERIFY_THRESHOLD = 35
+COLOR_HIST_BINS = (8, 8, 8)
+COLOR_THRESHOLD = 0.30
 
+class AnalyzeRequest(BaseModel):
+    image: str
+    target_x: float
+    target_y: float
+    box_scale: float
+
+def get_center_crop(img_bgr, crop_pct=0.5):
+    h, w = img_bgr.shape[:2]
+    crop_w = max(1, int(w * crop_pct))
+    crop_h = max(1, int(h * crop_pct))
+    x1 = (w - crop_w) // 2
+    y1 = (h - crop_h) // 2
+    x2 = x1 + crop_w
+    y2 = y1 + crop_h
+    return img_bgr[y1:y2, x1:x2]
+
+class HybridIdentifier:
+    def __init__(self):
+        self.orb = cv2.ORB_create(nfeatures=N_FEATURES)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        # Standard contrast
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
+        self.cards = self._load_brain()
+        print(f"[INFO] Brain Loaded: {len(self.cards)} cards.")
+
+    def close(self):
+        pass
+
+    def _calc_color_hist(self, img_bgr):
+        center = get_center_crop(img_bgr, 0.5)
+        hist = cv2.calcHist(
+            [center], [0, 1, 2], None, COLOR_HIST_BINS,
+            [0, 256, 0, 256, 0, 256]
+        )
+        return cv2.normalize(hist, hist).flatten()
+
+    def _load_brain(self):
+        if not os.path.exists(BRAIN_PATH):
+            print("[ERROR] Brain not found. Please run 'python compile_brain.py' first.")
+            return []
+        try:
+            with open(BRAIN_PATH, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Brain Load Error: {e}")
+            return []
+
+    def _get_sniper_crop(self, user_img, click_x_pct, click_y_pct, box_scale):
+        """
+        Extracts the exact Red Box area from the user's screen.
+        """
+        h, w = user_img.shape[:2]
+        center_x = int(click_x_pct * w)
+        center_y = int(click_y_pct * h)
+
+        # Calculate size based on Frontend Box Scale
+        box_w = int(w * box_scale)
+        box_h = int(box_w / 0.716)
+
+        x1 = max(0, center_x - box_w // 2)
+        y1 = max(0, center_y - box_h // 2)
+        x2 = min(w, center_x + box_w // 2)
+        y2 = min(h, center_y + box_h // 2)
+
+        return user_img[y1:y2, x1:x2]
+
+    def identify(self, user_image_base64, target_x, target_y, box_scale):
+        search_start = time.perf_counter()
+        if "," in user_image_base64:
+            user_image_base64 = user_image_base64.split(",")[1]
+
+        # 1. Decode
+        image_data = base64.b64decode(user_image_base64)
+        nparr = np.frombuffer(image_data, np.uint8)
+        user_img_color = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        # 2. SNIPER CROP (Get the perfect card image)
+        crop_color = self._get_sniper_crop(user_img_color, target_x, target_y, box_scale)
+
+        # 3. DEBUG: Save it so we know what we are matching against
+        cv2.imwrite("last_match_input.jpg", crop_color)
+        print("[DEBUG] Saved Crop to 'last_match_input.jpg'")
+
+        # 4. PREPARE FOR MATCHING
+        # Enhance contrast to help seeing through glare
+        lab = cv2.cvtColor(crop_color, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = self.clahe.apply(l)
+        enhanced_color = cv2.merge((l, a, b))
+        enhanced_color = cv2.cvtColor(enhanced_color, cv2.COLOR_LAB2BGR)
+
+        crop_gray = cv2.cvtColor(enhanced_color, cv2.COLOR_BGR2GRAY)
+        crop_hist = self._calc_color_hist(crop_color)
+
+        # Calculate pHash
+        crop_pil = Image.fromarray(crop_gray)
+        crop_phash = imagehash.phash(crop_pil)
+
+        # 5. RUN MATCHING
+        kp, user_des = self.orb.detectAndCompute(crop_gray, None)
+        if user_des is None:
+            print("[WARN] No features found in crop (Too blurry?)")
+            return {"match": False}
+
+        best_match = None
+        max_matches = 0
+
+        for card in self.cards:
+            if card["des"] is None:
+                continue
+            try:
+                matches = self.matcher.knnMatch(card["des"], user_des, k=2)
+                good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+                score = len(good)
+
+                if score > max_matches:
+                    max_matches = score
+                    best_match = card
+            except:
+                continue
+
+        # 6. VERIFY AND RETURN
+        if best_match and max_matches >= MIN_MATCHES:
+            color_corr = cv2.compareHist(
+                crop_hist, best_match["hist"], cv2.HISTCMP_CORREL
+            )
+            if color_corr < COLOR_THRESHOLD:
+                print(f"[VETO] ORB match but color mismatch (Corr {color_corr:.2f}).")
+                elapsed_ms = (time.perf_counter() - search_start) * 1000
+                print(f"[TIME] Search took {elapsed_ms:.2f} ms")
+                return {"match": False}
+
+            phash_diff = crop_phash - best_match["phash"]
+            print(
+                f"[MATCH] Top Match: {best_match['name']} (Score: {max_matches}) | "
+                f"Shape Diff: {phash_diff}"
+            )
+
+            # Shape Verification
+            if phash_diff > PHASH_VERIFY_THRESHOLD:
+                print(f"[VETO] Matches art but wrong shape (Diff {phash_diff}).")
+                elapsed_ms = (time.perf_counter() - search_start) * 1000
+                print(f"[TIME] Search took {elapsed_ms:.2f} ms")
+                return {"match": False}
+
+            elapsed_ms = (time.perf_counter() - search_start) * 1000
+            print(f"[TIME] Search took {elapsed_ms:.2f} ms")
+            return {"match": True, "card": best_match["name"]}
+
+        print(
+            f"[FAIL] No good match found. Best was "
+            f"{best_match['name'] if best_match else 'None'} ({max_matches})"
+        )
+        elapsed_ms = (time.perf_counter() - search_start) * 1000
+        print(f"[TIME] Search took {elapsed_ms:.2f} ms")
+        return {"match": False}
+
+identifier = HybridIdentifier()
+
+@app.on_event("shutdown")
+def shutdown_event():
+    identifier.close()
 
 @app.post("/analyze")
-def analyze(request: AnalyzeRequest):
-    image_bytes = decode_image(request.image)
-    mode = request.mode if request.mode in {"play", "collection"} else "play"
-    result = identifier.identify(image_bytes, mode)
-    if not result:
-        return {"match": False}
-    return result
-
-
-@app.post("/load-deck")
-def load_deck(request: LoadDeckRequest):
-    identifier.set_active_deck(request.decklist)
-    return {"status": "ok"}
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Aether-Sight Host Engine")
-    parser.add_argument("--headless", action="store_true", help="Enable UDP broadcast mode")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    if args.headless:
-        start_headless_broadcast(args.port)
-    import uvicorn
-
-    uvicorn.run(app, host=args.host, port=args.port)
-
-
-__all__ = ["app"]
+async def analyze_card(request: AnalyzeRequest):
+    return identifier.identify(request.image, request.target_x, request.target_y, request.box_scale)
