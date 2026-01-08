@@ -1,7 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 opencv-python
-numpy
 imagehash
-Pillow
 requests
+tqdm
+pillow
+numpy

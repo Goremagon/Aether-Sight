@@ -4,8 +4,14 @@
 // by the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-import GameRoom from "./components/GameRoom";
-
-export default function App() {
-  return <GameRoom />;
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
 }

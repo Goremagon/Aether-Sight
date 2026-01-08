@@ -4,8 +4,13 @@
 // by the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-import GameRoom from "./components/GameRoom";
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App.jsx'
+import './index.css'
 
-export default function App() {
-  return <GameRoom />;
-}
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+)
