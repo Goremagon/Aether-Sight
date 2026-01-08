@@ -21,7 +21,7 @@ except Exception:
 DB_PATH = "cards.db"
 BRAIN_PATH = "brain.pkl"
 COLOR_HIST_BINS = (8, 8, 8)
-N_FEATURES = 250
+N_FEATURES = 1000
 ART_CROP_PCT = 0.7
 
 

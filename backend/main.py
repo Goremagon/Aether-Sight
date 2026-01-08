@@ -28,9 +28,9 @@ app.add_middleware(
 
 # --- CONFIG ---
 BRAIN_PATH = "brain.pkl"
-N_FEATURES = 250
-MIN_MATCHES = 8
-PHASH_VERIFY_THRESHOLD = 15
+N_FEATURES = 1000
+MIN_MATCHES = 15
+PHASH_VERIFY_THRESHOLD = 30
 COLOR_HIST_BINS = (8, 8, 8)
 COLOR_THRESHOLD = 0.30
 ART_CROP_PCT = 0.7
@@ -151,7 +151,7 @@ class HybridIdentifier:
         top_candidates = [
             card for diff, card in phash_candidates
             if diff <= PHASH_VERIFY_THRESHOLD
-        ][:15]
+        ][:30]
 
         best_match = None
         max_matches = 0
@@ -161,7 +161,7 @@ class HybridIdentifier:
                 continue
             try:
                 matches = self.matcher.knnMatch(card["des"], user_des, k=2)
-                good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+                good = [m for m, n in matches if m.distance < 0.70 * n.distance]
                 score = len(good)
 
                 if score > max_matches:
