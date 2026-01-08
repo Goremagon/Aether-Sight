@@ -29,11 +29,11 @@ app.add_middleware(
 # --- CONFIG ---
 BRAIN_PATH = "brain.pkl"
 N_FEATURES = 1000
-MIN_MATCHES = 15
+MIN_MATCHES = 12
 PHASH_VERIFY_THRESHOLD = 30
 COLOR_HIST_BINS = (8, 8, 8)
-COLOR_THRESHOLD = 0.30
-ART_CROP_PCT = 0.7
+COLOR_THRESHOLD = 0.15
+ART_CROP_PCT = 1.0
 
 class AnalyzeRequest(BaseModel):
     image: str
@@ -64,7 +64,13 @@ class HybridIdentifier:
         pass
 
     def _calc_color_hist(self, img_bgr):
-        center = get_center_crop(img_bgr, ART_CROP_PCT)
+        # Hardcoded 90% center crop to drop borders but keep most data
+        h, w = img_bgr.shape[:2]
+        crop_h, crop_w = int(h * 0.9), int(w * 0.9)
+        y1 = (h - crop_h) // 2
+        x1 = (w - crop_w) // 2
+        center = img_bgr[y1:y1+crop_h, x1:x1+crop_w]
+
         hist = cv2.calcHist(
             [center], [0, 1, 2], None, COLOR_HIST_BINS,
             [0, 256, 0, 256, 0, 256]

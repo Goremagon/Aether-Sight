@@ -15,3 +15,4 @@ build/
 .env
 *.db
 backend/cards.db
+backend/brain.pkl
